@@ -1,9 +1,10 @@
-"""FastAPI 入口：演示消息生产、隔离查询/补正、净重明细查询。
+"""FastAPI 入口：演示消息生产、隔离查询/补正、净重明细查询、船方清单对账。
 
 启动时：
 1. 初始化数据库表；
 2. 确保 Topic 存在（Kafka 后端）；
-3. 启动后台消费工作线程（可通过 CONSUMER_ENABLED=false 关闭）。
+3. 启动后台消费工作线程（可通过 CONSUMER_ENABLED=false 关闭）；
+4. 恢复崩溃/重启遗留的在途（PENDING）核对单。
 """
 from __future__ import annotations
 
@@ -19,15 +20,34 @@ from app.config import get_settings
 from app.consumer import ConsumerWorker
 from app.database import get_database, get_session
 from app.messaging import get_broker
-from app.models import QuarantineRecord, QuarantineStatus
+from app.models import QuarantineRecord, QuarantineStatus, ReconciliationJob, ReconciliationStatus
+from app.reconciliation import (
+    ReconciliationError,
+    create_reconciliation,
+    list_jobs,
+    load_basis,
+    load_match_lines,
+    load_ranges,
+    publish_reconciliation,
+    recover_pending_jobs,
+    refresh_job,
+)
 from app.schemas import (
+    BasisRecordOut,
     CorrectionRequest,
     CorrectionResult,
     HealthOut,
+    ManifestLineIn,
+    MatchLineOut,
     NetWeightOut,
+    OffsetRangeOut,
     ProducedMessage,
     ProduceMessageRequest,
+    PublishResult,
     QuarantineOut,
+    ReconcileRequest,
+    ReconciliationOut,
+    ReconciliationSummary,
 )
 from app.services import (
     CorrectionError,
@@ -65,6 +85,14 @@ async def lifespan(app: FastAPI):
                 logger.exception("topic 初始化失败（若已存在可忽略）")
         _worker = ConsumerWorker(broker=broker)
         _worker.start()
+
+    # 恢复崩溃/重启遗留的在途核对单：结论与依据会被幂等重算后一起生效
+    try:
+        with db.session() as session:
+            recover_pending_jobs(session)
+    except Exception:
+        logger.exception("启动恢复在途核对单失败（将在下次访问时重试）")
+
     logger.info("weighbridge API ready (instance=%s, version=%s)",
                 settings.instance_id, __version__)
     try:
@@ -76,14 +104,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="港口地磅称量流 - 净重明细服务",
+    title="港口地磅称量流 - 净重明细与清单对账服务",
     description=(
         "## 功能\n"
         "- 接收含箱号、毛重、皮重（整数千克）的称量消息；\n"
         "- 字段无效或毛重 < 皮重的消息进入隔离区，可按源分区/offset 查看原文并补正；\n"
         "- 合法消息生成净重明细，每条源消息保证仅入仓一次；\n"
-        "- 双实例同组消费两分区，持久化成功后才提交消费位点，失败可接续、不丢不重。\n\n"
-        "在本页 **Try it out** 即可发送演示消息、提交补正并查询结果。"
+        "- 双实例同组消费两分区，持久化成功后才提交消费位点，失败可接续、不丢不重；\n"
+        "- **船方清单对账**：提交至多 80 行清单与至多 160 个源位置范围，\n"
+        "  按范围内已入仓明细做二分图匹配，返回唯一对应（通过）、无解（不通过）\n"
+        "  或两份不同完整对应（多解）；范围内任何新增/补正入仓都会使核对单过期。\n\n"
+        "在本页 **Try it out** 即可发送演示消息、提交补正、发起对账并发布核对单。"
     ),
     version=__version__,
     lifespan=lifespan,
@@ -292,3 +323,133 @@ def get_quarantine_one(
     if row is None:
         raise HTTPException(status_code=404, detail=f"隔离记录 {quarantine_id} 不存在")
     return QuarantineOut.model_validate(row)
+
+
+# --------------------------------------------------------------------------
+# 船方清单对账
+# --------------------------------------------------------------------------
+
+def _serialize_job(session: Session, job: ReconciliationJob) -> ReconciliationOut:
+    """组装核对单详情：清单、范围、完整依据、对应（结论与依据一起返回）。"""
+    manifest = [ManifestLineIn(**line) for line in json.loads(job.manifest_payload)]
+    ranges = [OffsetRangeOut.model_validate(r) for r in load_ranges(session, job.id)]
+    basis = [
+        BasisRecordOut(
+            net_weight_id=b.net_weight_id,
+            container_no=b.container_no,
+            net_weight=b.net_weight,
+            source_partition=b.source_partition,
+            source_offset=b.source_offset,
+            from_correction=b.from_correction,
+        )
+        for b in load_basis(session, job.id)
+    ]
+    matchings = [
+        [MatchLineOut.model_validate(line) for line in lines]
+        for _, lines in sorted(load_match_lines(session, job.id).items())
+    ]
+    return ReconciliationOut(
+        id=job.id,
+        topic=job.topic,
+        status=job.status,
+        passed=job.passed,
+        manifest_row_count=job.manifest_row_count,
+        source_position_count=job.source_position_count,
+        manifest=manifest,
+        offset_ranges=ranges,
+        basis_records=basis,
+        matchings=matchings,
+        result_detail=job.result_detail,
+        expire_reason=job.expire_reason,
+        accepted_at=job.accepted_at,
+        finalized_at=job.finalized_at,
+        published_at=job.published_at,
+        expired_at=job.expired_at,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+    )
+
+
+def _raise_recon_error(exc: ReconciliationError) -> None:
+    raise HTTPException(status_code=exc.status_code, detail={
+        "code": exc.code, "message": exc.detail,
+    }) from exc
+
+
+@app.post(
+    "/reconciliations",
+    response_model=ReconciliationOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["清单对账"],
+    summary="受理船方清单对账（至多 80 行、合计至多 160 个源位置）",
+)
+def submit_reconciliation(
+    req: ReconcileRequest,
+    session: Session = Depends(get_session),
+) -> ReconciliationOut:
+    try:
+        job = create_reconciliation(session, req, topic=settings.topic)
+    except ReconciliationError as exc:
+        _raise_recon_error(exc)
+    return _serialize_job(session, job)
+
+
+@app.get(
+    "/reconciliations",
+    response_model=list[ReconciliationSummary],
+    tags=["清单对账"],
+    summary="查询核对单列表（可按状态过滤；过期单不会提供当前通过结论）",
+)
+def list_reconciliations(
+    status_filter: ReconciliationStatus | None = Query(
+        default=None, alias="status", description="PENDING/PASSED/AMBIGUOUS/REJECTED/EXPIRED"
+    ),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    session: Session = Depends(get_session),
+) -> list[ReconciliationSummary]:
+    rows = list_jobs(session, status=status_filter, limit=limit, offset=offset)
+    return [ReconciliationSummary.model_validate(r) for r in rows]
+
+
+@app.get(
+    "/reconciliations/{job_id}",
+    response_model=ReconciliationOut,
+    tags=["清单对账"],
+    summary="查询核对单详情（结论、完整依据与对应；读取时做失效复核）",
+)
+def get_reconciliation(
+    job_id: int,
+    session: Session = Depends(get_session),
+) -> ReconciliationOut:
+    job = refresh_job(session, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"核对单 {job_id} 不存在")
+    return _serialize_job(session, job)
+
+
+@app.post(
+    "/reconciliations/{job_id}/publish",
+    response_model=PublishResult,
+    tags=["清单对账"],
+    summary="发布核对单结论（过期单/不通过单拒绝发布；并发发布行锁串行化）",
+)
+def publish_reconciliation_endpoint(
+    job_id: int,
+    session: Session = Depends(get_session),
+) -> PublishResult:
+    try:
+        job = publish_reconciliation(session, job_id)
+    except ReconciliationError as exc:
+        _raise_recon_error(exc)
+    detail = (
+        "已发布（重复发布幂等返回）" if job.published_at else "发布成功"
+    )
+    return PublishResult(
+        id=job.id,
+        status=job.status,
+        published=True,
+        pass_result=job.passed,
+        detail=detail,
+        reconciliation=_serialize_job(session, job),
+    )

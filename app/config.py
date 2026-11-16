@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     # 重量绝对值上限（整数千克），防止离谱值
     max_weight_kg: int = 1_000_000_000
 
+    # ---- 对账规则 ----
+    # 单次受理的清单行数上限
+    recon_max_manifest_rows: int = 80
+    # 所有分区范围合计源位置（offset 个数）上限
+    recon_max_source_positions: int = 160
+    # 单个 offset 范围的最大跨度，防止极端区间
+    recon_max_range_span: int = 1_000_000_000
+
     # ---- 运行控制 ----
     consumer_enabled: bool = Field(default=True)
     instance_id: str = Field(default="instance-1")

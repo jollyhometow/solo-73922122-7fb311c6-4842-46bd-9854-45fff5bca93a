@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import NetWeightRecord, QuarantineRecord, QuarantineStatus
+from app.reconciliation import expire_jobs_for_position
 from app.validation import InvalidWeighEvent, ValidWeighEvent, parse_and_validate
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,11 @@ def process_consumed_message(
                 from_correction=False,
             )
             session.add(record)
+            session.flush()  # 先取得明细 id，并让唯一约束提前生效
+            # 同事务失效覆盖该位点的在途/已生效核对单（范围外变化不命中）
+            expire_jobs_for_position(
+                session, topic=topic, partition=partition, offset=offset
+            )
             session.commit()
             return ConsumptionOutcome(
                 action="NET_RECORD", record_id=record.id, detail="净重明细已入仓"
@@ -193,6 +199,14 @@ def apply_correction(
         )
         session.add(net)
         session.flush()  # 先让唯一约束在同一事务内生效
+
+        # 补正入仓与核对单失效在同一事务原子生效
+        expire_jobs_for_position(
+            session,
+            topic=q.topic,
+            partition=q.source_partition,
+            offset=q.source_offset,
+        )
 
         q.status = QuarantineStatus.CORRECTED
         q.container_no = validation.container_no

@@ -1,7 +1,10 @@
-# 港口地磅称量流 · 净重明细服务
+# 港口地磅称量流 · 净重明细与船方清单对账服务
 
 把地磅称量消息（箱号、毛重、皮重，整数千克）整理成**净重明细**入仓；
 字段无效或毛重小于皮重的消息进入**隔离区**，可查看原文并**补正**后入仓。
+并提供**船方清单对账 API**：按受理范围内已入仓明细核对船方清单，
+自动判定唯一对应（通过）、无解（不通过）或多解（两份不同完整对应），
+范围内任何新增/补正入仓都会使核对单过期。
 
 技术栈：**FastAPI + PostgreSQL + 本地 Redpanda（Kafka 协议）+ Docker Compose**，
 两个 API 实例以**同一消费组**消费**两个分区**。
@@ -81,7 +84,63 @@ curl -X POST http://localhost:8001/quarantine/1/correction \
 | GET | `/quarantine/by-position/{partition}/{offset}` | **按源分区与 offset 查看隔离原文** |
 | GET | `/quarantine/{id}` | 按主键查单条隔离记录 |
 | POST | `/quarantine/{id}/correction` | 提交补正（每条仅接受一次合法补正） |
+| POST | `/reconciliations` | **受理船方清单对账，返回结论与完整依据/对应** |
+| GET | `/reconciliations` | 查询核对单列表（可按状态过滤） |
+| GET | `/reconciliations/{id}` | 查询核对单详情（读取时做失效复核） |
+| POST | `/reconciliations/{id}/publish` | 发布核对单结论（过期/不通过/多解单拒绝发布） |
 | GET | `/health` | 健康检查与当前分配分区 |
+
+---
+
+## 2A. 船方清单对账
+
+### 受理请求
+
+`POST /reconciliations`，请求体两部分：
+
+- `manifest`：船方清单，**至多 80 行**；每行含唯一 `line_no`、`container_no`、
+  整数净重闭区间 `[net_weight_min, net_weight_max]`（严格整数，布尔/浮点/字符串数字 422）；
+- `offset_ranges`：本主题各分区的**左闭右开** offset 范围
+  `[{partition, offset_start, offset_end}]`，各段跨度合计**至多 160 个源位置**；
+  同分区范围不允许重叠（端点相接 `[a,b)+[b,c)` 合法）。
+
+```bash
+curl -X POST http://localhost:8001/reconciliations -H 'Content-Type: application/json' -d '{
+  "manifest": [
+    {"line_no": "L1", "container_no": "MSCU1234567", "net_weight_min": 15000, "net_weight_max": 17000},
+    {"line_no": "L2", "container_no": "MSCU7654321", "net_weight_min": 14000, "net_weight_max": 16000}
+  ],
+  "offset_ranges": [
+    {"partition": 0, "offset_start": 0, "offset_end": 20},
+    {"partition": 1, "offset_start": 0, "offset_end": 20}
+  ]
+}'
+```
+
+### 对账口径（按受理时范围内已入仓明细）
+
+- 一条清单行可匹配一条净重明细当且仅当 **箱号相同且净重在闭区间内**；
+- **每条明细最多使用一次，允许剩余**（多余明细不影响结论）；
+- 这是一个二分图匹配问题，服务端返回三种结论：
+
+| status | 含义 | 返回 |
+| --- | --- | --- |
+| `PASSED` | 全部清单行只有**一份完整对应** | `passed=true` + 唯一对应 `matchings[0]` |
+| `REJECTED` | **无解**，不存在覆盖全部行的完整对应 | `passed=false`，`matchings=[]`，附原因 |
+| `AMBIGUOUS` | **多解**，存在多份完整对应 | `passed=false` + **两份不同完整对应** `matchings[0..1]` |
+
+- 每次受理都保存**核对单与依据**：清单原文、范围、受理时范围内全部净重明细快照
+  （`basis_records`）、结论与逐行对应（含箱号、净重、来源分区/offset）。
+
+### 失效与发布
+
+- 范围内**任何新增入仓或补正入仓**，都会使**在途（PENDING）及已完成**的核对单
+  立即变为 `EXPIRED`，必须重新核对；**范围外变化不影响**。
+- 过期单**不能发布**，GET 详情也不会再提供“当前通过”结论（`passed=null`），
+  但历史依据与失效原因仍可查询。
+- `POST /reconciliations/{id}/publish` 仅 `PASSED` 单可发布，重复发布幂等；
+  `REJECTED` / `AMBIGUOUS` / `EXPIRED` 一律 409 拒绝。
+- 重新核对即再次 `POST /reconciliations`，生成一张新核对单。
 
 ---
 
@@ -101,6 +160,16 @@ curl -X POST http://localhost:8001/quarantine/1/correction \
 - 同样以 `(topic, source_partition, source_offset)` 唯一约束，**同文不同位置分别保留**
 - 状态机：`OPEN` → `CORRECTED`（只允许翻转一次）
 - `correction_attempts`、`last_correction_error` 记录失败补正（失败保持 `OPEN`）
+
+### 对账四表（`reconciliation_*`）
+
+- `reconciliation_jobs`：核对单主表。保存清单原文、行数/源位置数、状态机
+  （`PENDING → PASSED / REJECTED / AMBIGUOUS → EXPIRED`）、受理时位置快照
+  `basis_snapshot`、结论说明、失效原因、受理/生效/发布/失效时间戳；
+- `reconciliation_ranges`：核对单声明的左闭右开范围（同分区可多段、不可重叠）；
+- `reconciliation_basis`：核对依据，受理时范围内每条净重明细的完整快照；
+- `reconciliation_match_lines`：逐行对应，`matching_no=1` 为第一份完整对应，
+  `matching_no=2` 仅在多解时存在，两份对应必然不同且各自明细不重复。
 
 ---
 
@@ -150,6 +219,27 @@ curl -X POST http://localhost:8001/quarantine/1/correction \
 - 毛重、皮重必须是**严格整数**（布尔、浮点、字符串数字一律拒绝），非负且不超上限；
 - 毛重 ≥ 皮重，否则以 `GROSS_LT_TARE` 隔离；毛重 = 皮重合法（净重 0）。
 
+### 4.7 对账正确性（匹配、失效、并发、重启）
+
+- **匹配判定**：清单行与净重明细构成二分图，候选边 = 箱号相同且净重落入闭区间；
+  Kuhn 增广路求第一份完整对应，再以“非匹配边 L→R、匹配边 R→L”构造有向图，
+  **存在有向环即多解**（环上翻转得到第二份对应），无环即唯一，无解时无完整对应。
+  明细在一份对应内不重复、整体允许剩余。
+- **结论与依据原子生效**：受理先落 `PENDING` 单与范围（独立事务），
+  再在第二个事务内写快照、依据、对应并翻转结论；进程在两步之间崩溃会留下
+  `PENDING` 单，启动恢复（或下次 GET/发布）幂等重算，不会出现“有结论无依据”。
+- **不占写锁、不阻塞消费**：匹配计算只读净重表、只写对账表；入仓路径仅额外执行
+  一条走索引的批量 UPDATE 失效核对单，锁只落在对账表，净重明细写路径不被对账阻塞。
+- **失效双保险，不漏受理到发布间的变化**：
+  1. 主动失效——消费入仓/补正入仓在**写净重明细的同一事务**内，
+     把范围覆盖该位点的在途/已完成核对单置 `EXPIRED`，入仓与失效原子可见；
+  2. 读取/发布前再比对“当前范围内位置集合 == 受理快照”，兜底任何边缘时序。
+  范围外位点不命中任何范围，天然不影响核对单。
+- **发布守卫**：`SELECT ... FOR UPDATE`（PostgreSQL 行锁）串行化并发发布，
+  发布前强制快照复核；过期单、无解单、多解单一律 409，重复发布幂等。
+- **双实例**：所有状态集中在共享 PostgreSQL，无进程内权威状态；任一实例受理、
+  另一实例都能查到同一核对单并看到一致的失效结论。
+
 ---
 
 ## 5. 本地开发与自测
@@ -183,16 +273,18 @@ uvicorn app.main:app --reload --port 8000
 
 ```
 app/
-  config.py            # 环境变量配置
+  config.py            # 环境变量配置（含对账 80 行 / 160 位置上限）
   database.py          # 引擎/会话/建表
-  models.py            # 净重明细、隔离记录 ORM（含唯一约束/检查约束）
+  models.py            # 净重明细、隔离记录、核对单/范围/依据/对应 ORM
   validation.py        # 纯函数消息校验（各类隔离原因）
+  matching.py          # 对账二分图匹配引擎（Kuhn + 有向环判多解，纯函数）
+  reconciliation.py    # 受理、快照、失效钩子、崩溃恢复、发布守卫、查询
   schemas.py           # HTTP 请求/响应模型
   messaging.py         # Broker 抽象：Kafka(redpanda) 实现 + 内存实现
   consumer.py          # 消费工作线程：先落库后提交位点、失败 seek 重试
-  services.py          # 幂等入仓、隔离、补正状态机、查询
-  main.py              # FastAPI 入口与路由
-tests/                 # 校验/服务/端到端/消费者可靠性测试
+  services.py          # 幂等入仓、隔离、补正状态机（入仓同事务触发对账失效）
+  main.py              # FastAPI 入口与路由（含对账四接口与启动恢复）
+tests/                 # 校验/服务/匹配引擎/对账/端到端/消费者可靠性测试
 scripts/entrypoint.sh  # 容器入口：等待依赖后启动 uvicorn
 docker-compose.yml     # postgres + redpanda + topic-init + app-1 + app-2 + console
 Dockerfile
@@ -209,17 +301,33 @@ Dockerfile
 - 按源分区 + offset 查隔离原文；同文不同位置分别保留；
 - 补正状态机（行锁 + 唯一约束），每条仅一次合法补正，失败保持隔离；
 - “先持久化后提交位点”、失败 seek 重试、重放幂等去重、迟到消息不覆盖补正；
-- 可启动全部服务的 Docker Compose（含健康检查、Topic 初始化、Redpanda Console）。
+- **船方清单对账**：80 行 / 160 位置上限与全套输入校验（行号唯一、严格整数、
+  左闭右开、区间不重叠、分区存在）；二分图匹配给出唯一/无解/多解（两份对应）结论；
+  核对单、范围、依据快照、逐行对应完整落库；
+- **失效机制**：入仓/补正同事务主动失效 + 读取/发布快照复核双保险，
+  在途与已完成单都会过期，范围外变化不影响；过期单不可发布、不提供当前通过结论；
+- **崩溃恢复**：PENDING 在途单启动时/访问时幂等重算，结论与依据一起生效；
+  发布用行锁串行化、重复发布幂等；
+- 可启动全部服务的 Docker Compose（含健康检查、Topic 初始化、Redpanda Console），
+  原有接口全部保留，`/docs` 可对账、查单、发消息和补正。
 
 ### 已验证（本地，无 Docker 守护进程）
 
-- 28 项测试通过、1 项平台相关 xfail，多轮重复运行稳定；
-- 真实 uvicorn 进程 HTTP 冒烟：投递→入仓/隔离→非法补正被拒→合法补正→重复补正 409；
-- 全部模块（含真实 `confluent-kafka`、`psycopg2`）可导入，compose YAML 与入口脚本语法校验通过。
+- **67 项测试通过、1 项平台相关 xfail**，多轮重复运行稳定；
+  新增 `test_matching.py`（匹配引擎）与 `test_reconciliation.py`（对账服务+HTTP E2E）；
+- 真实 uvicorn 进程 HTTP 冒烟全链路：投递→入仓→对账唯一/多解/无解→发布与幂等→
+  范围内新消息致已发布单过期、过期单发布 409→范围外变化不影响→补正致过期→
+  手工构造 PENDING 单后重启自动恢复为 PASSED；
+- 严格整数拒绝布尔/浮点（422）、161 位置/重复行号等业务校验返回 422；
+- 全部模块（含真实 `confluent-kafka`、`psycopg2`）可导入；
+  新表 PostgreSQL DDL、失效 UPDATE 的 PG 方言 SQL、compose YAML 均静态校验通过。
 
 ### 未完成 / 需在目标环境验证
 
 - 当前沙箱**没有 Docker 守护进程与 PostgreSQL/Redpanda 服务**，
-  无法在本机实际 `docker compose up` 验证容器编排与真实 Kafka 行锁行为；
-  相关路径已通过接口抽象、配置与静态检查保证，建议在有 Docker 的环境执行一次第 1、2 节流程确认。
+  无法在本机实际 `docker compose up` 验证容器编排、真实 PostgreSQL `FOR UPDATE`
+  行锁与 Kafka 重平衡行为；这些路径已通过接口抽象、PG DDL/SQL 静态检查与
+  SQLite 多连接测试覆盖，建议在有 Docker 的环境执行一次第 1、2、2A 节流程确认；
+- 并发安全的确定路径由顺序状态机测试 + PostgreSQL 行锁/唯一约束设计保证，
+  SQLite 单文件库无法复现真实多连接行锁（沿用基线 xfail 说明）；
 - 建表演示用 `create_all`，生产可替换为 Alembic 迁移。

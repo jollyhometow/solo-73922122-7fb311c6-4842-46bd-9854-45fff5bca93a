@@ -7,9 +7,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator
 
-from app.models import QuarantineStatus
+from app.models import QuarantineStatus, ReconciliationStatus
 
 
 class ProduceMessageRequest(BaseModel):
@@ -97,3 +97,127 @@ class HealthOut(BaseModel):
     instance_id: str
     consumer_enabled: bool
     assigned_partitions: list[int] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------
+# 船方清单对账
+# --------------------------------------------------------------------------
+
+class OffsetRangeIn(BaseModel):
+    """某分区上的左闭右开 offset 范围 [offset_start, offset_end)。"""
+
+    partition: StrictInt = Field(..., ge=0, examples=[0])
+    offset_start: StrictInt = Field(..., ge=0, examples=[0])
+    offset_end: StrictInt = Field(..., ge=1, examples=[10])
+
+
+class ManifestLineIn(BaseModel):
+    """清单行：唯一行号、箱号、整数净重闭区间 [net_weight_min, net_weight_max]。"""
+
+    line_no: str = Field(..., min_length=1, max_length=64, examples=["L1"])
+    container_no: str = Field(..., min_length=1, max_length=32, examples=["MSCU1234567"])
+    # 严格整数：布尔/浮点/字符串数字一律 422，避免区间被误写
+    net_weight_min: StrictInt = Field(..., ge=0, examples=[15000])
+    net_weight_max: StrictInt = Field(..., ge=0, examples=[17000])
+
+
+class ReconcileRequest(BaseModel):
+    """对账受理请求：清单 + 本主题各分区的左闭右开 offset 范围。"""
+
+    manifest: list[ManifestLineIn] = Field(
+        ..., min_length=1, description="船方清单，至多 80 行，行号唯一"
+    )
+    offset_ranges: list[OffsetRangeIn] = Field(
+        ..., min_length=1, description="左闭右开 offset 范围，合计源位置至多 160 个"
+    )
+
+
+class MatchLineOut(BaseModel):
+    """一份完整对应中的单行指派。"""
+
+    line_no: str
+    container_no: str
+    net_weight_min: int
+    net_weight_max: int
+    net_weight_id: int
+    matched_container_no: str
+    matched_net_weight: int
+    source_partition: int
+    source_offset: int
+
+    model_config = {"from_attributes": True}
+
+
+class BasisRecordOut(BaseModel):
+    """核对依据：受理快照中的一条净重明细。"""
+
+    net_weight_id: int
+    container_no: str
+    net_weight: int
+    source_partition: int
+    source_offset: int
+    from_correction: bool
+
+    model_config = {"from_attributes": True}
+
+
+class OffsetRangeOut(BaseModel):
+    # ORM 字段名为 source_partition，对外统一为 partition
+    partition: int = Field(validation_alias="source_partition")
+    offset_start: int
+    offset_end: int
+
+    model_config = {"from_attributes": True, "populate_by_name": True}
+
+
+class ReconciliationOut(BaseModel):
+    """核对单详情：结论、完整依据、对应（通过/多解时）。"""
+
+    id: int
+    topic: str
+    status: ReconciliationStatus
+    passed: bool | None
+    manifest_row_count: int
+    source_position_count: int
+    manifest: list[ManifestLineIn]
+    offset_ranges: list[OffsetRangeOut]
+    basis_records: list[BasisRecordOut]
+    matchings: list[list[MatchLineOut]]
+    result_detail: str | None = None
+    expire_reason: str | None = None
+    accepted_at: datetime
+    finalized_at: datetime | None = None
+    published_at: datetime | None = None
+    expired_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReconciliationSummary(BaseModel):
+    """核对单列表项。"""
+
+    id: int
+    topic: str
+    status: ReconciliationStatus
+    passed: bool | None
+    manifest_row_count: int
+    source_position_count: int
+    result_detail: str | None = None
+    expire_reason: str | None = None
+    accepted_at: datetime
+    finalized_at: datetime | None = None
+    published_at: datetime | None = None
+    expired_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class PublishResult(BaseModel):
+    """发布结果。"""
+
+    id: int
+    status: ReconciliationStatus
+    published: bool
+    pass_result: bool | None = None
+    detail: str
+    reconciliation: ReconciliationOut
